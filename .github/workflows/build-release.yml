@@ -86,8 +86,8 @@ jobs:
       - name: Fetch Termux aarch64 sysroot
         run: |
           sudo mkdir -p "${TERMUX_PREFIX}" "${TERMUX_LOCAL}/lib/pkgconfig" "${TERMUX_LOCAL}/bin"
+          sudo python3 scripts/ci/fetch-termux-sysroot.py /
           sudo chown -R "$(id -u):$(id -g)" /data
-          python3 scripts/ci/fetch-termux-sysroot.py /
 
       - name: Create Meson cross & native files
         run: |
