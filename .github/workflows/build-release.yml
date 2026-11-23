@@ -61,7 +61,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bzip2 curl dpkg file git glslang-tools libexpat1-dev \
             ninja-build patch patchelf pkg-config python3-pip tar xz-utils
-          python3 -m pip install --break-system-packages "meson>=1.4"
+          sudo python3 -m pip install --break-system-packages "meson>=1.4"
           if ! command -v glslang >/dev/null 2>&1 && command -v glslangValidator >/dev/null 2>&1; then
             sudo ln -sf "$(command -v glslangValidator)" /usr/local/bin/glslang
           fi
