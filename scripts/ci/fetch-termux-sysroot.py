@@ -18,9 +18,7 @@ MIRRORS = [
 
 REPO_SPECS = [
     ("termux-main", "dists/stable/main/binary-aarch64/Packages"),
-    ("termux-main", "dists/stable/main/binary-all/Packages"),
     ("termux-x11", "dists/x11/main/binary-aarch64/Packages"),
-    ("termux-x11", "dists/x11/main/binary-all/Packages"),
 ]
 
 ROOT_PACKAGES = [
