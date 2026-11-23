@@ -1,0 +1,263 @@
+name: Build & Release SwayFX PanVK (Termux ARM64)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint Scripts & Patches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Check shell scripts & Python helper
+        run: |
+          scripts=(
+            bin/gpu
+            scripts/install-panvk.sh
+            scripts/install-release.sh
+            scripts/build-local.sh
+          )
+          for s in "${scripts[@]}"; do
+            bash -n "$s"
+          done
+          shellcheck -S warning "${scripts[@]}"
+          python3 -m py_compile scripts/ci/fetch-termux-sysroot.py
+
+  build-termux-aarch64:
+    name: Cross-Compile wlroots + scenefx + swayfx (Termux aarch64)
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      WLROOTS_VER: "0.20.2"
+      WLROOTS_SHA256: "20c37b521dc3054b6e9627b79bdd45fc716db9ebc58bdf97e57e84d04b04610f"
+      SCENEFX_COMMIT: "98429c6f98f77b08b10e8cedd780966a4fe446fc"
+      SWAYFX_TAG: "0.6.1"
+      WAYLAND_SCANNER_VER: "1.24.0"
+      TERMUX_PREFIX: "/data/data/com.termux/files/usr"
+      TERMUX_LOCAL: "/data/data/com.termux/files/home/.local"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bzip2 curl dpkg file git glslang-tools libexpat1-dev \
+            ninja-build patch patchelf pkg-config python3-pip tar xz-utils
+          python3 -m pip install --break-system-packages "meson>=1.4"
+          if ! command -v glslang >/dev/null 2>&1 && command -v glslangValidator >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v glslangValidator)" /usr/local/bin/glslang
+          fi
+
+      - name: Build native wayland-scanner >= 1.24
+        run: |
+          mkdir -p /tmp/wl-scanner
+          curl -fL --retry 3 \
+            "https://gitlab.freedesktop.org/wayland/wayland/-/releases/${WAYLAND_SCANNER_VER}/downloads/wayland-${WAYLAND_SCANNER_VER}.tar.xz" \
+            -o /tmp/wl-scanner/wayland.tar.xz
+          tar -xJf /tmp/wl-scanner/wayland.tar.xz -C /tmp/wl-scanner
+          meson setup /tmp/wl-scanner/build "/tmp/wl-scanner/wayland-${WAYLAND_SCANNER_VER}" \
+            --prefix=/usr/local \
+            -Dlibraries=false \
+            -Ddocumentation=false \
+            -Dtests=false \
+            -Ddtd_validation=false
+          ninja -C /tmp/wl-scanner/build
+          sudo ninja -C /tmp/wl-scanner/build install
+          /usr/local/bin/wayland-scanner --version
+
+      - name: Fetch Termux aarch64 sysroot
+        run: |
+          sudo mkdir -p "${TERMUX_PREFIX}" "${TERMUX_LOCAL}/lib/pkgconfig" "${TERMUX_LOCAL}/bin"
+          sudo chown -R "$(id -u):$(id -g)" /data
+          python3 scripts/ci/fetch-termux-sysroot.py /
+
+      - name: Create Meson cross & native files
+        run: |
+          NDK_DIR="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$NDK_DIR" ] || [ ! -d "$NDK_DIR" ]; then
+            NDK_DIR="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n1)"
+          fi
+          if [ -z "$NDK_DIR" ] || [ ! -d "$NDK_DIR" ]; then
+            echo "Android NDK not found on runner" >&2
+            exit 1
+          fi
+          TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "Using Android NDK toolchain: $TOOLCHAIN"
+
+          sudo tee /usr/local/bin/termux-pkg-config >/dev/null <<EOF
+          #!/bin/sh
+          export PKG_CONFIG_PATH=""
+          export PKG_CONFIG_LIBDIR="${TERMUX_LOCAL}/lib/pkgconfig:${TERMUX_PREFIX}/lib/pkgconfig:${TERMUX_PREFIX}/share/pkgconfig"
+          exec /usr/bin/pkg-config "\$@"
+          EOF
+          sudo chmod 0755 /usr/local/bin/termux-pkg-config
+
+          sudo tee /usr/local/bin/native-pkg-config >/dev/null <<'EOF'
+          #!/bin/sh
+          export PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
+          export PKG_CONFIG_LIBDIR="/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+          exec /usr/bin/pkg-config "$@"
+          EOF
+          sudo chmod 0755 /usr/local/bin/native-pkg-config
+
+          cat > /tmp/termux-aarch64.cross <<EOF
+          [binaries]
+          c = '${TOOLCHAIN}/aarch64-linux-android24-clang'
+          cpp = '${TOOLCHAIN}/aarch64-linux-android24-clang++'
+          ar = '${TOOLCHAIN}/llvm-ar'
+          strip = '${TOOLCHAIN}/llvm-strip'
+          pkg-config = '/usr/local/bin/termux-pkg-config'
+
+          [built-in options]
+          c_args = ['-D__TERMUX__=1', '-I${TERMUX_PREFIX}/include']
+          c_link_args = ['-L${TERMUX_LOCAL}/lib', '-L${TERMUX_PREFIX}/lib', '-Wl,-rpath-link,${TERMUX_LOCAL}/lib', '-Wl,-rpath-link,${TERMUX_PREFIX}/lib', '-Wl,-rpath,${TERMUX_LOCAL}/lib', '-Wl,-rpath,${TERMUX_PREFIX}/lib']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+
+          cat > /tmp/host.native <<'EOF'
+          [binaries]
+          pkg-config = '/usr/local/bin/native-pkg-config'
+          EOF
+
+      - name: Build & install patched wlroots
+        run: |
+          mkdir -p /tmp/build-src
+          curl -fL --retry 3 \
+            "https://gitlab.freedesktop.org/wlroots/wlroots/-/archive/${WLROOTS_VER}/wlroots-${WLROOTS_VER}.tar.bz2" \
+            -o "/tmp/build-src/wlroots-${WLROOTS_VER}.tar.bz2"
+          echo "${WLROOTS_SHA256}  /tmp/build-src/wlroots-${WLROOTS_VER}.tar.bz2" | sha256sum -c -
+          tar -xjf "/tmp/build-src/wlroots-${WLROOTS_VER}.tar.bz2" -C /tmp/build-src
+          WLROOTS_SRC="/tmp/build-src/wlroots-${WLROOTS_VER}"
+          cp -r patches/wlroots/termuxgui-src/* "$WLROOTS_SRC/"
+          for p in patches/wlroots/*.patch; do
+            echo "Applying $(basename "$p")"
+            patch -d "$WLROOTS_SRC" -p1 < "$p"
+          done
+
+          meson setup "$WLROOTS_SRC/build" "$WLROOTS_SRC" \
+            --cross-file /tmp/termux-aarch64.cross \
+            --native-file /tmp/host.native \
+            --prefix="${TERMUX_LOCAL}" \
+            --libdir="lib" \
+            -Dbuildtype=release \
+            -Dexamples=false \
+            -Dxwayland=enabled \
+            -Dsession=disabled \
+            -Dbackends=x11,termuxgui \
+            -Drenderers=gles2 \
+            -Dc_args="-D__TERMUX__=1 -I${TERMUX_PREFIX}/include -Wno-alloca -Wno-strict-prototypes" \
+            -Dc_link_args="-L${TERMUX_LOCAL}/lib -L${TERMUX_PREFIX}/lib -Wl,-rpath-link,${TERMUX_LOCAL}/lib -Wl,-rpath-link,${TERMUX_PREFIX}/lib -Wl,-rpath,${TERMUX_LOCAL}/lib -Wl,-rpath,${TERMUX_PREFIX}/lib"
+          ninja -C "$WLROOTS_SRC/build"
+          ninja -C "$WLROOTS_SRC/build" install
+
+      - name: Build & install patched scenefx
+        run: |
+          SCENEFX_SRC="/tmp/build-src/scenefx"
+          git clone https://github.com/wlrfx/scenefx.git "$SCENEFX_SRC"
+          git -C "$SCENEFX_SRC" checkout "${SCENEFX_COMMIT}"
+          for p in patches/scenefx/*.patch; do
+            echo "Applying $(basename "$p")"
+            patch -d "$SCENEFX_SRC" -p1 < "$p"
+          done
+
+          meson setup "$SCENEFX_SRC/build" "$SCENEFX_SRC" \
+            --cross-file /tmp/termux-aarch64.cross \
+            --native-file /tmp/host.native \
+            --prefix="${TERMUX_LOCAL}" \
+            --libdir="lib" \
+            -Dbuildtype=release \
+            -Dexamples=false \
+            -Drenderers=gles2 \
+            -Dc_args="-D__TERMUX__=1 -I${TERMUX_PREFIX}/include -Wno-alloca -Wno-strict-prototypes -Wno-unused-function" \
+            -Dc_link_args="-L${TERMUX_LOCAL}/lib -L${TERMUX_PREFIX}/lib -Wl,-rpath-link,${TERMUX_LOCAL}/lib -Wl,-rpath-link,${TERMUX_PREFIX}/lib -Wl,-rpath,${TERMUX_LOCAL}/lib -Wl,-rpath,${TERMUX_PREFIX}/lib"
+          ninja -C "$SCENEFX_SRC/build"
+          ninja -C "$SCENEFX_SRC/build" install
+          patchelf --set-rpath "${TERMUX_LOCAL}/lib:${TERMUX_PREFIX}/lib" "${TERMUX_LOCAL}/lib/libscenefx-0.5.so"
+
+      - name: Build & install patched swayfx
+        run: |
+          SWAYFX_SRC="/tmp/build-src/swayfx"
+          git clone --depth 1 --branch "${SWAYFX_TAG}" https://github.com/WillPower3309/swayfx.git "$SWAYFX_SRC"
+          for p in patches/swayfx/*.patch; do
+            echo "Applying $(basename "$p")"
+            patch -d "$SWAYFX_SRC" -p1 < "$p"
+          done
+
+          meson setup "$SWAYFX_SRC/build" "$SWAYFX_SRC" \
+            --cross-file /tmp/termux-aarch64.cross \
+            --native-file /tmp/host.native \
+            --prefix="${TERMUX_LOCAL}" \
+            --libdir="lib" \
+            --sysconfdir="${TERMUX_PREFIX}/etc" \
+            -Dbuildtype=release \
+            -Dman-pages=disabled \
+            -Dtray=disabled \
+            -Ddefault-wallpaper=false \
+            -Dc_args="-D__TERMUX__=1 -I${TERMUX_PREFIX}/include -Wno-alloca -Wno-deprecated-declarations -Wno-unused-function" \
+            -Dc_link_args="-L${TERMUX_LOCAL}/lib -L${TERMUX_PREFIX}/lib -Wl,-rpath-link,${TERMUX_LOCAL}/lib -Wl,-rpath-link,${TERMUX_PREFIX}/lib -landroid-wordexp -Wl,-rpath,${TERMUX_LOCAL}/lib -Wl,-rpath,${TERMUX_PREFIX}/lib"
+          ninja -C "$SWAYFX_SRC/build" sway/sway
+          install -m 0755 "$SWAYFX_SRC/build/sway/sway" "${TERMUX_LOCAL}/bin/swayfx"
+          install -m 0755 bin/gpu "${TERMUX_LOCAL}/bin/gpu"
+          patchelf --set-rpath "${TERMUX_LOCAL}/lib:${TERMUX_PREFIX}/lib" "${TERMUX_LOCAL}/bin/swayfx"
+
+      - name: Verify ELF binaries & package release tarball
+        run: |
+          for bin in "${TERMUX_LOCAL}/bin/swayfx" "${TERMUX_LOCAL}/lib/libwlroots-0.20.so" "${TERMUX_LOCAL}/lib/libscenefx-0.5.so"; do
+            file "$bin"
+            file "$bin" | grep -q "ARM aarch64"
+            readelf -d "$bin" | grep -E 'NEEDED|RUNPATH|RPATH'
+          done
+
+          mkdir -p dist
+          tar -czf dist/swayfx-panvk-termux-aarch64.tar.gz -C "${TERMUX_LOCAL}" \
+            bin/swayfx \
+            bin/gpu \
+            lib/libwlroots-0.20.so \
+            lib/libscenefx-0.5.so \
+            lib/pkgconfig/wlroots-0.20.pc \
+            lib/pkgconfig/scenefx-0.5.pc \
+            include/wlroots-0.20 \
+            include/scenefx-0.5
+          (cd dist && sha256sum swayfx-panvk-termux-aarch64.tar.gz > SHA256SUMS)
+          ls -lh dist/
+          cat dist/SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: swayfx-panvk-termux-aarch64
+          path: |
+            dist/swayfx-panvk-termux-aarch64.tar.gz
+            dist/SHA256SUMS
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/swayfx-panvk-termux-aarch64.tar.gz
+            dist/SHA256SUMS

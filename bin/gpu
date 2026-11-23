@@ -1,0 +1,103 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
+PANVK_ICD="$PREFIX_DIR/share/vulkan/icd.d/panfrost_icd.aarch64.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  gpu <command> [args...]          Run command with PanVK Vulkan + Zink OpenGL
+  gpu --virgl <command> [args...]  Run command with legacy VirGL ANGLE backend
+  gpu --check                      Print PanVK Vulkan and Zink OpenGL diagnostics
+  gpu -h | --help                  Show this help
+EOF
+}
+
+require_panvk_icd() {
+  if [ ! -f "$PANVK_ICD" ]; then
+    echo "ERROR: PanVK ICD manifest not found: $PANVK_ICD" >&2
+    exit 1
+  fi
+}
+
+run_panvk_check() {
+  require_panvk_icd
+  local vk_out glx_out egl_out
+  echo "=== Vulkan (PanVK) ==="
+  vk_out="$(VK_DRIVER_FILES="$PANVK_ICD" VK_ICD_FILENAMES="$PANVK_ICD" vulkaninfo --summary 2>&1 || true)"
+  printf '%s\n' "$vk_out" | grep -E 'Vulkan Instance Version:|apiVersion|driverVersion|vendorID|deviceID|deviceType|deviceName|driverID|driverName|driverInfo|conformanceVersion|ERROR|WARNING' || printf '%s\n' "$vk_out"
+
+  if [ -n "${DISPLAY:-}" ]; then
+    echo ""
+    echo "=== OpenGL GLX (Zink over PanVK, DISPLAY=$DISPLAY) ==="
+    glx_out="$(env -u LIBGL_ALWAYS_SOFTWARE -u MESA_LOADER_DRIVER_OVERRIDE \
+      VK_DRIVER_FILES="$PANVK_ICD" VK_ICD_FILENAMES="$PANVK_ICD" \
+      GALLIUM_DRIVER=zink \
+      glxinfo -B 2>&1 || true)"
+    printf '%s\n' "$glx_out" | grep -E 'name of display:|direct rendering:|Vendor:|Device:|Version:|Accelerated:|Video memory:|OpenGL (vendor|renderer|core profile version|version|ES profile version) string:|Error' || printf '%s\n' "$glx_out"
+  fi
+
+  if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    echo ""
+    echo "=== OpenGL EGL (Zink over PanVK, WAYLAND_DISPLAY=$WAYLAND_DISPLAY) ==="
+    egl_out="$(env -u DISPLAY -u LIBGL_ALWAYS_SOFTWARE -u MESA_LOADER_DRIVER_OVERRIDE \
+      VK_DRIVER_FILES="$PANVK_ICD" VK_ICD_FILENAMES="$PANVK_ICD" \
+      GALLIUM_DRIVER=zink \
+      eglinfo -B 2>&1 || true)"
+    printf '%s\n' "$egl_out" | sed -n '/^Wayland platform:/,/^$/p'
+  fi
+
+  if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    echo ""
+    echo "Note: DISPLAY and WAYLAND_DISPLAY are unset; skipped Zink GLX/EGL display checks."
+  fi
+}
+
+if [ "$#" -eq 0 ]; then
+  usage
+  exit 2
+fi
+
+case "$1" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --check)
+    if [ "$#" -ne 1 ]; then
+      usage
+      exit 2
+    fi
+    run_panvk_check
+    exit 0
+    ;;
+  --virgl)
+    shift
+    if [ "$#" -eq 0 ]; then
+      usage
+      exit 2
+    fi
+    "$SCRIPT_DIR/virgl-angle" start
+    exec env -u LIBGL_ALWAYS_SOFTWARE \
+      GALLIUM_DRIVER=virpipe \
+      MESA_GL_VERSION_OVERRIDE=4.1COMPAT \
+      MESA_GLSL_VERSION_OVERRIDE=410 \
+      "$@"
+    ;;
+  --)
+    shift
+    if [ "$#" -eq 0 ]; then
+      usage
+      exit 2
+    fi
+    ;;
+esac
+
+require_panvk_icd
+exec env -u LIBGL_ALWAYS_SOFTWARE -u MESA_LOADER_DRIVER_OVERRIDE \
+  VK_DRIVER_FILES="$PANVK_ICD" \
+  VK_ICD_FILENAMES="$PANVK_ICD" \
+  GALLIUM_DRIVER=zink \
+  "$@"

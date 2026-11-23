@@ -1,0 +1,276 @@
+diff --git a/include/render/gles2.h b/include/render/gles2.h
+index 6b852dc..716a44c 100644
+--- a/include/render/gles2.h
++++ b/include/render/gles2.h
+@@ -103,6 +103,8 @@ struct wlr_gles2_buffer {
+ 	struct wlr_gles2_renderer *renderer;
+ 	struct wl_list link; // wlr_gles2_renderer.buffers
+ 	bool external_only;
++	bool is_data_ptr;
++	uint32_t drm_format;
+ 
+ 	EGLImageKHR image;
+ 	GLuint rbo;
+diff --git a/render/gles2/pass.c b/render/gles2/pass.c
+index a70ea13..b83a8fc 100644
+--- a/render/gles2/pass.c
++++ b/render/gles2/pass.c
+@@ -7,6 +7,7 @@
+ #include <wlr/util/transform.h>
+ #include "render/egl.h"
+ #include "render/gles2.h"
++#include "render/pixel_format.h"
+ #include "util/matrix.h"
+ 
+ #define MAX_QUADS 86 // 4kb
+@@ -60,6 +61,48 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+ 		glFlush();
+ 	}
+ 
++	if (pass->buffer->is_data_ptr) {
++		struct wlr_buffer *wlr_buffer = pass->buffer->buffer;
++		const struct wlr_gles2_pixel_format *fmt =
++			get_gles2_format_from_drm(pass->buffer->drm_format);
++		const struct wlr_pixel_format_info *drm_fmt =
++			fmt != NULL ? drm_get_pixel_format_info(fmt->drm_format) : NULL;
++		void *data = NULL;
++		uint32_t format = 0;
++		size_t stride = 0;
++		if (fmt == NULL || drm_fmt == NULL) {
++			wlr_log(WLR_ERROR, "Unsupported data_ptr pixel format 0x%"PRIX32,
++				pass->buffer->drm_format);
++			goto out;
++		}
++		if (fmt->gl_format == GL_BGRA_EXT &&
++				!pass->buffer->renderer->exts.EXT_read_format_bgra) {
++			wlr_log(WLR_ERROR,
++				"Cannot read pixels: missing GL_EXT_read_format_bgra extension");
++			goto out;
++		}
++		if (!wlr_buffer_begin_data_ptr_access(wlr_buffer,
++				WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
++			wlr_log(WLR_ERROR, "Failed to lock data_ptr buffer for GLES2 readback");
++			goto out;
++		}
++		GLuint fbo = gles2_buffer_get_fbo(pass->buffer);
++		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++		glPixelStorei(GL_PACK_ALIGNMENT, 1);
++		uint32_t pack_stride = pixel_format_info_min_stride(drm_fmt, wlr_buffer->width);
++		if (pack_stride == stride) {
++			glReadPixels(0, 0, wlr_buffer->width, wlr_buffer->height,
++				fmt->gl_format, fmt->gl_type, data);
++		} else {
++			unsigned char *p = data;
++			for (int32_t i = 0; i < wlr_buffer->height; ++i) {
++				glReadPixels(0, i, wlr_buffer->width, 1,
++					fmt->gl_format, fmt->gl_type, p + (size_t)i * stride);
++			}
++		}
++		wlr_buffer_end_data_ptr_access(wlr_buffer);
++	}
++
+ 	ok = true;
+ 
+ out:
+diff --git a/render/gles2/renderer.c b/render/gles2/renderer.c
+index e362dae..117d9e7 100644
+--- a/render/gles2/renderer.c
++++ b/render/gles2/renderer.c
+@@ -65,7 +65,9 @@ static void destroy_buffer(struct wlr_gles2_buffer *buffer) {
+ 
+ 	pop_gles2_debug(buffer->renderer);
+ 
+-	wlr_egl_destroy_image(buffer->renderer->egl, buffer->image);
++	if (buffer->image != EGL_NO_IMAGE_KHR) {
++		wlr_egl_destroy_image(buffer->renderer->egl, buffer->image);
++	}
+ 
+ 	wlr_egl_restore_context(&prev_ctx);
+ 
+@@ -95,18 +97,37 @@ GLuint gles2_buffer_get_fbo(struct wlr_gles2_buffer *buffer) {
+ 
+ 	push_gles2_debug(buffer->renderer);
+ 
+-	if (!buffer->rbo) {
+-		glGenRenderbuffers(1, &buffer->rbo);
+-		glBindRenderbuffer(GL_RENDERBUFFER, buffer->rbo);
+-		buffer->renderer->procs.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER,
+-			buffer->image);
+-		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+-	}
++	if (buffer->is_data_ptr) {
++		if (!buffer->tex) {
++			glGenTextures(1, &buffer->tex);
++			glBindTexture(GL_TEXTURE_2D, buffer->tex);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, buffer->buffer->width,
++				buffer->buffer->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++			glBindTexture(GL_TEXTURE_2D, 0);
++		}
++
++		glGenFramebuffers(1, &buffer->fbo);
++		glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
++		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++			GL_TEXTURE_2D, buffer->tex, 0);
++	} else {
++		if (!buffer->rbo) {
++			glGenRenderbuffers(1, &buffer->rbo);
++			glBindRenderbuffer(GL_RENDERBUFFER, buffer->rbo);
++			buffer->renderer->procs.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER,
++				buffer->image);
++			glBindRenderbuffer(GL_RENDERBUFFER, 0);
++		}
+ 
+-	glGenFramebuffers(1, &buffer->fbo);
+-	glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
+-	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+-		GL_RENDERBUFFER, buffer->rbo);
++		glGenFramebuffers(1, &buffer->fbo);
++		glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
++		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++			GL_RENDERBUFFER, buffer->rbo);
++	}
+ 	GLenum fb_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+ 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+ 
+@@ -139,14 +160,32 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
+ 	buffer->renderer = renderer;
+ 
+ 	struct wlr_dmabuf_attributes dmabuf = {0};
+-	if (!wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
+-		goto error_buffer;
+-	}
++	if ((renderer->wlr_renderer.render_buffer_caps & WLR_BUFFER_CAP_DMABUF) &&
++			wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
++		buffer->image = wlr_egl_create_image_from_dmabuf(renderer->egl,
++			&dmabuf, &buffer->external_only);
++		if (buffer->image == EGL_NO_IMAGE_KHR) {
++			goto error_buffer;
++		}
++	} else {
++		void *data = NULL;
++		uint32_t format = 0;
++		size_t stride = 0;
++		if (!wlr_buffer_begin_data_ptr_access(wlr_buffer,
++				WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
++			goto error_buffer;
++		}
++		wlr_buffer_end_data_ptr_access(wlr_buffer);
+ 
+-	buffer->image = wlr_egl_create_image_from_dmabuf(renderer->egl,
+-		&dmabuf, &buffer->external_only);
+-	if (buffer->image == EGL_NO_IMAGE_KHR) {
+-		goto error_buffer;
++		const struct wlr_gles2_pixel_format *fmt = get_gles2_format_from_drm(format);
++		if (fmt == NULL || !is_gles2_pixel_format_supported(renderer, fmt)) {
++			wlr_log(WLR_ERROR, "Unsupported data_ptr buffer pixel format 0x%"PRIX32,
++				format);
++			goto error_buffer;
++		}
++		buffer->is_data_ptr = true;
++		buffer->drm_format = format;
++		buffer->image = EGL_NO_IMAGE_KHR;
+ 	}
+ 
+ 	wlr_addon_init(&buffer->addon, &wlr_buffer->addons, renderer,
+@@ -168,6 +207,9 @@ static const struct wlr_drm_format_set *gles2_get_texture_formats(
+ 		struct wlr_renderer *wlr_renderer, uint32_t buffer_caps) {
+ 	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
+ 	if (buffer_caps & WLR_BUFFER_CAP_DMABUF) {
++		if (!(wlr_renderer->render_buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
++			return NULL;
++		}
+ 		return wlr_egl_get_dmabuf_texture_formats(renderer->egl);
+ 	} else if (buffer_caps & WLR_BUFFER_CAP_DATA_PTR) {
+ 		return &renderer->shm_texture_formats;
+@@ -176,10 +218,47 @@ static const struct wlr_drm_format_set *gles2_get_texture_formats(
+ 	}
+ }
+ 
++static const struct wlr_drm_format_set *get_data_ptr_render_formats(
++		struct wlr_gles2_renderer *renderer) {
++	static struct wlr_drm_format_set formats = {0};
++	static bool initialized = false;
++	if (!initialized) {
++		initialized = true;
++		static const uint32_t candidates[] = {
++			0x34325241, /* DRM_FORMAT_ARGB8888 */
++			0x34325258, /* DRM_FORMAT_XRGB8888 */
++			0x34324241, /* DRM_FORMAT_ABGR8888 */
++			0x34324258, /* DRM_FORMAT_XBGR8888 */
++		};
++		for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
++			const struct wlr_gles2_pixel_format *fmt =
++				get_gles2_format_from_drm(candidates[i]);
++			if (fmt == NULL || !is_gles2_pixel_format_supported(renderer, fmt)) {
++				continue;
++			}
++			if (fmt->gl_format == GL_BGRA_EXT && !renderer->exts.EXT_read_format_bgra) {
++				continue;
++			}
++			wlr_drm_format_set_add(&formats, candidates[i],
++				0x00ffffffffffffffULL /* DRM_FORMAT_MOD_INVALID */);
++			wlr_drm_format_set_add(&formats, candidates[i],
++				0ULL /* DRM_FORMAT_MOD_LINEAR */);
++		}
++	}
++	return &formats;
++}
++
+ static const struct wlr_drm_format_set *gles2_get_render_formats(
+ 		struct wlr_renderer *wlr_renderer) {
+ 	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
+-	return wlr_egl_get_dmabuf_render_formats(renderer->egl);
++	if (wlr_renderer->render_buffer_caps & WLR_BUFFER_CAP_DMABUF) {
++		const struct wlr_drm_format_set *dmabuf_formats =
++			wlr_egl_get_dmabuf_render_formats(renderer->egl);
++		if (dmabuf_formats != NULL && dmabuf_formats->len > 0) {
++			return dmabuf_formats;
++		}
++	}
++	return get_data_ptr_render_formats(renderer);
+ }
+ 
+ static int gles2_get_drm_fd(struct wlr_renderer *wlr_renderer) {
+@@ -525,7 +604,13 @@ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
+ 	if (renderer == NULL) {
+ 		return NULL;
+ 	}
+-	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
++	uint32_t caps = WLR_BUFFER_CAP_DATA_PTR;
++	const char *no_dmabuf = getenv("WLR_GLES2_NO_DMABUF");
++	if (no_dmabuf == NULL ||
++			(strcmp(no_dmabuf, "1") != 0 && strcmp(no_dmabuf, "true") != 0)) {
++		caps |= WLR_BUFFER_CAP_DMABUF;
++	}
++	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, caps);
+ 	renderer->wlr_renderer.features.output_color_transform = false;
+ 
+ 	wl_list_init(&renderer->buffers);
+@@ -541,7 +626,8 @@ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
+ 	wlr_log(WLR_INFO, "GL renderer: %s", glGetString(GL_RENDERER));
+ 	wlr_log(WLR_INFO, "Supported GLES2 extensions: %s", exts_str);
+ 
+-	if (!renderer->egl->exts.EXT_image_dma_buf_import) {
++	if ((renderer->wlr_renderer.render_buffer_caps & WLR_BUFFER_CAP_DMABUF) &&
++			!renderer->egl->exts.EXT_image_dma_buf_import) {
+ 		wlr_log(WLR_ERROR, "EGL_EXT_image_dma_buf_import not supported");
+ 		free(renderer);
+ 		return NULL;
+diff --git a/render/gles2/texture.c b/render/gles2/texture.c
+index 9a967eb..6dea5f4 100644
+--- a/render/gles2/texture.c
++++ b/render/gles2/texture.c
+@@ -416,7 +416,8 @@ struct wlr_texture *gles2_texture_from_buffer(struct wlr_renderer *wlr_renderer,
+ 	uint32_t format;
+ 	size_t stride;
+ 	struct wlr_dmabuf_attributes dmabuf;
+-	if (wlr_buffer_get_dmabuf(buffer, &dmabuf)) {
++	if ((wlr_renderer->render_buffer_caps & WLR_BUFFER_CAP_DMABUF) &&
++			wlr_buffer_get_dmabuf(buffer, &dmabuf)) {
+ 		return gles2_texture_from_dmabuf(renderer, buffer, &dmabuf);
+ 	} else if (wlr_buffer_begin_data_ptr_access(buffer,
+ 			WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &format, &stride)) {

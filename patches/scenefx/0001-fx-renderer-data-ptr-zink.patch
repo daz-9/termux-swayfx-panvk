@@ -1,0 +1,447 @@
+diff --git a/include/render/fx_renderer/fx_renderer.h b/include/render/fx_renderer/fx_renderer.h
+index cafd7a5..900c3be 100644
+--- a/include/render/fx_renderer/fx_renderer.h
++++ b/include/render/fx_renderer/fx_renderer.h
+@@ -40,6 +40,9 @@ struct fx_framebuffer {
+ 	struct fx_renderer *renderer;
+ 	struct wl_list link; // fx_renderer.buffers
+ 	bool external_only;
++	bool is_data_ptr;
++	bool skip_readback;
++	uint32_t drm_format;
+ 
+ 	EGLImageKHR image;
+ 	GLuint rbo;
+@@ -58,6 +61,8 @@ void fx_framebuffer_get_or_create_custom(struct fx_renderer *fx_renderer,
+ 		struct wlr_allocator *allocator, int width, int height, bool has_alpha,
+ 		struct fx_framebuffer **fx_buffer, bool *failed);
+ 
++struct fx_framebuffer *fx_framebuffer_try_get(struct fx_renderer *renderer,
++		struct wlr_buffer *wlr_buffer);
+ struct fx_framebuffer *fx_framebuffer_get_or_create(struct fx_renderer *renderer,
+ 		struct wlr_buffer *wlr_buffer);
+ 
+diff --git a/render/egl.c b/render/egl.c
+index 85d5f6f..ee56e4b 100644
+--- a/render/egl.c
++++ b/render/egl.c
+@@ -297,6 +297,7 @@ static bool egl_init_display(struct wlr_egl *egl, EGLDisplay display,
+ 		check_egl_ext(display_exts_str, "EGL_EXT_create_context_robustness");
+ 
+ 	const char *device_exts_str = NULL, *driver_name = NULL;
++#ifndef __TERMUX__
+ 	if (egl->exts.EXT_device_query) {
+ 		EGLAttrib device_attrib;
+ 		if (!egl->procs.eglQueryDisplayAttribEXT(egl->display,
+@@ -338,6 +339,7 @@ static bool egl_init_display(struct wlr_egl *egl, EGLDisplay display,
+ 			}
+ 		}
+ 	}
++#endif
+ 
+ 	if (!check_egl_ext(display_exts_str, "EGL_KHR_no_config_context") &&
+ 			!check_egl_ext(display_exts_str, "EGL_MESA_configless_context")) {
+@@ -458,6 +460,7 @@ static bool egl_init(struct wlr_egl *egl, EGLenum platform,
+ 
+ static bool device_has_name(const drmDevice *device, const char *name);
+ 
++#ifndef __TERMUX__
+ static EGLDeviceEXT get_egl_device_from_drm_fd(struct wlr_egl *egl,
+ 		int drm_fd) {
+ 	if (egl->procs.eglQueryDevicesEXT == NULL) {
+@@ -557,6 +560,7 @@ static int open_render_node(int drm_fd) {
+ 	free(render_name);
+ 	return render_fd;
+ }
++#endif
+ 
+ struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd) {
+ 	bool allow_software = drm_fd < 0;
+@@ -567,6 +571,7 @@ struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd) {
+ 		return NULL;
+ 	}
+ 
++#ifndef __TERMUX__
+ 	if (egl->exts.EXT_platform_device) {
+ 		/*
+ 		 * Search for the EGL device matching the DRM fd using the
+@@ -584,8 +589,14 @@ struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd) {
+ 	} else {
+ 		wlr_log(WLR_DEBUG, "EXT_platform_device not supported");
+ 	}
++#endif
+ 
++#ifndef __TERMUX__
+ 	if (egl->exts.KHR_platform_gbm && drm_fd >= 0) {
++#else
++	if (egl->exts.KHR_platform_gbm) {
++#endif
++#ifndef __TERMUX__
+ 		int gbm_fd = open_render_node(drm_fd);
+ 		if (gbm_fd < 0) {
+ 			wlr_log(WLR_ERROR, "Failed to open DRM render node");
+@@ -598,14 +609,19 @@ struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd) {
+ 			wlr_log(WLR_ERROR, "Failed to create GBM device");
+ 			goto error;
+ 		}
++#endif
+ 
+ 		if (egl_init(egl, EGL_PLATFORM_GBM_KHR, egl->gbm_device, allow_software)) {
+ 			wlr_log(WLR_DEBUG, "Using EGL_PLATFORM_GBM_KHR");
+ 			return egl;
+ 		}
+ 
++#ifndef __TERMUX__
+ 		gbm_device_destroy(egl->gbm_device);
+ 		close(gbm_fd);
++#else
++		goto error;
++#endif
+ 	} else {
+ 		wlr_log(WLR_DEBUG, "KHR_platform_gbm not supported");
+ 	}
+diff --git a/render/fx_renderer/fx_framebuffer.c b/render/fx_renderer/fx_framebuffer.c
+index d514b34..b99ddf5 100644
+--- a/render/fx_renderer/fx_framebuffer.c
++++ b/render/fx_renderer/fx_framebuffer.c
+@@ -30,18 +30,37 @@ GLuint fx_framebuffer_get_fbo(struct fx_framebuffer *buffer) {
+ 
+ 	push_fx_debug(buffer->renderer);
+ 
+-	if (!buffer->rbo) {
+-		glGenRenderbuffers(1, &buffer->rbo);
+-		glBindRenderbuffer(GL_RENDERBUFFER, buffer->rbo);
+-		buffer->renderer->procs.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER,
+-				buffer->image);
+-		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+-	}
++	if (buffer->is_data_ptr) {
++		if (!buffer->tex) {
++			glGenTextures(1, &buffer->tex);
++			glBindTexture(GL_TEXTURE_2D, buffer->tex);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, buffer->buffer->width,
++					buffer->buffer->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++			glBindTexture(GL_TEXTURE_2D, 0);
++		}
+ 
+-	glGenFramebuffers(1, &buffer->fbo);
+-	glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
+-	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+-			GL_RENDERBUFFER, buffer->rbo);
++		glGenFramebuffers(1, &buffer->fbo);
++		glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
++		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++				GL_TEXTURE_2D, buffer->tex, 0);
++	} else {
++		if (!buffer->rbo) {
++			glGenRenderbuffers(1, &buffer->rbo);
++			glBindRenderbuffer(GL_RENDERBUFFER, buffer->rbo);
++			buffer->renderer->procs.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER,
++					buffer->image);
++			glBindRenderbuffer(GL_RENDERBUFFER, 0);
++		}
++
++		glGenFramebuffers(1, &buffer->fbo);
++		glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
++		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++				GL_RENDERBUFFER, buffer->rbo);
++	}
+ 	GLenum fb_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+ 
+ 	// Init stencil buffer
+@@ -114,9 +133,21 @@ void fx_framebuffer_get_or_create_custom(struct fx_renderer *renderer,
+ 		*failed = true;
+ 		return;
+ 	}
++	(*fx_framebuffer)->skip_readback = true;
+ 	fx_framebuffer_get_fbo(*fx_framebuffer);
+ }
+ 
++struct fx_framebuffer *fx_framebuffer_try_get(struct fx_renderer *renderer,
++		struct wlr_buffer *wlr_buffer) {
++	struct wlr_addon *addon =
++		wlr_addon_find(&wlr_buffer->addons, renderer, &buffer_addon_impl);
++	if (addon) {
++		struct fx_framebuffer *buffer = wl_container_of(addon, buffer, addon);
++		return buffer;
++	}
++	return NULL;
++}
++
+ struct fx_framebuffer *fx_framebuffer_get_or_create(struct fx_renderer *renderer,
+ 		struct wlr_buffer *wlr_buffer) {
+ 	struct wlr_addon *addon =
+@@ -135,14 +166,32 @@ struct fx_framebuffer *fx_framebuffer_get_or_create(struct fx_renderer *renderer
+ 	buffer->renderer = renderer;
+ 
+ 	struct wlr_dmabuf_attributes dmabuf = {0};
+-	if (!wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
+-		goto error_buffer;
+-	}
++	if ((renderer->wlr_renderer.render_buffer_caps & WLR_BUFFER_CAP_DMABUF) &&
++			wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
++		buffer->image = wlr_egl_create_image_from_dmabuf(renderer->egl,
++			&dmabuf, &buffer->external_only);
++		if (buffer->image == EGL_NO_IMAGE_KHR) {
++			goto error_buffer;
++		}
++	} else {
++		void *data = NULL;
++		uint32_t format = 0;
++		size_t stride = 0;
++		if (!wlr_buffer_begin_data_ptr_access(wlr_buffer,
++				WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
++			goto error_buffer;
++		}
++		wlr_buffer_end_data_ptr_access(wlr_buffer);
+ 
+-	buffer->image = wlr_egl_create_image_from_dmabuf(renderer->egl,
+-		&dmabuf, &buffer->external_only);
+-	if (buffer->image == EGL_NO_IMAGE_KHR) {
+-		goto error_buffer;
++		const struct fx_pixel_format *fmt = get_fx_format_from_drm(format);
++		if (fmt == NULL || !is_fx_pixel_format_supported(renderer, fmt)) {
++			wlr_log(WLR_ERROR, "Unsupported data_ptr buffer pixel format 0x%"PRIX32,
++				format);
++			goto error_buffer;
++		}
++		buffer->is_data_ptr = true;
++		buffer->drm_format = format;
++		buffer->image = EGL_NO_IMAGE_KHR;
+ 	}
+ 
+ 	wlr_addon_init(&buffer->addon, &wlr_buffer->addons, renderer,
+@@ -186,7 +235,9 @@ void fx_framebuffer_destroy(struct fx_framebuffer *fx_buffer) {
+ 	glDeleteRenderbuffers(1, &fx_buffer->sb);
+ 	fx_buffer->sb = -1;
+ 
+-	wlr_egl_destroy_image(fx_buffer->renderer->egl, fx_buffer->image);
++	if (fx_buffer->image != EGL_NO_IMAGE_KHR) {
++		wlr_egl_destroy_image(fx_buffer->renderer->egl, fx_buffer->image);
++	}
+ 
+ 	wlr_egl_restore_context(&prev_ctx);
+ 
+diff --git a/render/fx_renderer/fx_pass.c b/render/fx_renderer/fx_pass.c
+index b3b1a13..dc55bee 100644
+--- a/render/fx_renderer/fx_pass.c
++++ b/render/fx_renderer/fx_pass.c
+@@ -15,6 +15,7 @@
+ #include "render/fx_renderer/fx_renderer.h"
+ #include "render/fx_renderer/shaders.h"
+ #include "render/pass.h"
++#include "render/pixel_format.h"
+ #include "render/tracy.h"
+ #include "scenefx/render/fx_renderer/fx_offscreen_buffers.h"
+ #include "scenefx/render/fx_renderer/fx_renderer.h"
+@@ -151,6 +152,48 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+ 		glFlush();
+ 	}
+ 
++	if (pass->buffer->is_data_ptr && !pass->buffer->skip_readback) {
++		struct wlr_buffer *wlr_buffer = pass->buffer->buffer;
++		const struct fx_pixel_format *fmt =
++			get_fx_format_from_drm(pass->buffer->drm_format);
++		const struct wlr_pixel_format_info *drm_fmt =
++			fmt != NULL ? drm_get_pixel_format_info(fmt->drm_format) : NULL;
++		void *data = NULL;
++		uint32_t format = 0;
++		size_t stride = 0;
++		if (fmt == NULL || drm_fmt == NULL) {
++			wlr_log(WLR_ERROR, "Unsupported data_ptr pixel format 0x%"PRIX32,
++				pass->buffer->drm_format);
++			goto out;
++		}
++		if (fmt->gl_format == GL_BGRA_EXT &&
++				!pass->buffer->renderer->exts.EXT_read_format_bgra) {
++			wlr_log(WLR_ERROR,
++				"Cannot read pixels: missing GL_EXT_read_format_bgra extension");
++			goto out;
++		}
++		if (!wlr_buffer_begin_data_ptr_access(wlr_buffer,
++				WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
++			wlr_log(WLR_ERROR, "Failed to lock data_ptr buffer for FX readback");
++			goto out;
++		}
++		GLuint fbo = fx_framebuffer_get_fbo(pass->buffer);
++		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++		glPixelStorei(GL_PACK_ALIGNMENT, 1);
++		uint32_t pack_stride = pixel_format_info_min_stride(drm_fmt, wlr_buffer->width);
++		if (pack_stride == stride) {
++			glReadPixels(0, 0, wlr_buffer->width, wlr_buffer->height,
++				fmt->gl_format, fmt->gl_type, data);
++		} else {
++			unsigned char *p = data;
++			for (int32_t i = 0; i < wlr_buffer->height; ++i) {
++				glReadPixels(0, i, wlr_buffer->width, 1,
++					fmt->gl_format, fmt->gl_type, p + (size_t)i * stride);
++			}
++		}
++		wlr_buffer_end_data_ptr_access(wlr_buffer);
++	}
++
+ 	ok = true;
+ 
+ out:
+diff --git a/render/fx_renderer/fx_renderer.c b/render/fx_renderer/fx_renderer.c
+index 5e751d4..f104ff3 100644
+--- a/render/fx_renderer/fx_renderer.c
++++ b/render/fx_renderer/fx_renderer.c
+@@ -56,6 +56,9 @@ static const struct wlr_drm_format_set *fx_get_texture_formats(
+ 		struct wlr_renderer *wlr_renderer, uint32_t buffer_caps) {
+ 	struct fx_renderer *renderer = fx_get_renderer(wlr_renderer);
+ 	if (buffer_caps & WLR_BUFFER_CAP_DMABUF) {
++		if (!(wlr_renderer->render_buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
++			return NULL;
++		}
+ 		return wlr_egl_get_dmabuf_texture_formats(renderer->egl);
+ 	} else if (buffer_caps & WLR_BUFFER_CAP_DATA_PTR) {
+ 		return &renderer->shm_texture_formats;
+@@ -64,10 +67,47 @@ static const struct wlr_drm_format_set *fx_get_texture_formats(
+ 	}
+ }
+ 
++static const struct wlr_drm_format_set *get_data_ptr_render_formats(
++		struct fx_renderer *renderer) {
++	static struct wlr_drm_format_set formats = {0};
++	static bool initialized = false;
++	if (!initialized) {
++		initialized = true;
++		static const uint32_t candidates[] = {
++			0x34325241, /* DRM_FORMAT_ARGB8888 */
++			0x34325258, /* DRM_FORMAT_XRGB8888 */
++			0x34324241, /* DRM_FORMAT_ABGR8888 */
++			0x34324258, /* DRM_FORMAT_XBGR8888 */
++		};
++		for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
++			const struct fx_pixel_format *fmt =
++				get_fx_format_from_drm(candidates[i]);
++			if (fmt == NULL || !is_fx_pixel_format_supported(renderer, fmt)) {
++				continue;
++			}
++			if (fmt->gl_format == GL_BGRA_EXT && !renderer->exts.EXT_read_format_bgra) {
++				continue;
++			}
++			wlr_drm_format_set_add(&formats, candidates[i],
++				0x00ffffffffffffffULL /* DRM_FORMAT_MOD_INVALID */);
++			wlr_drm_format_set_add(&formats, candidates[i],
++				0ULL /* DRM_FORMAT_MOD_LINEAR */);
++		}
++	}
++	return &formats;
++}
++
+ static const struct wlr_drm_format_set *fx_get_render_formats(
+ 		struct wlr_renderer *wlr_renderer) {
+ 	struct fx_renderer *renderer = fx_get_renderer(wlr_renderer);
+-	return wlr_egl_get_dmabuf_render_formats(renderer->egl);
++	if (wlr_renderer->render_buffer_caps & WLR_BUFFER_CAP_DMABUF) {
++		const struct wlr_drm_format_set *dmabuf_formats =
++			wlr_egl_get_dmabuf_render_formats(renderer->egl);
++		if (dmabuf_formats != NULL && dmabuf_formats->len > 0) {
++			return dmabuf_formats;
++		}
++	}
++	return get_data_ptr_render_formats(renderer);
+ }
+ 
+ static int fx_get_drm_fd(struct wlr_renderer *wlr_renderer) {
+@@ -439,7 +479,13 @@ struct wlr_renderer *fx_renderer_create_egl(struct wlr_egl *egl) {
+ 	if (renderer == NULL) {
+ 		return NULL;
+ 	}
+-	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
++	uint32_t caps = WLR_BUFFER_CAP_DATA_PTR;
++	const char *no_dmabuf = getenv("WLR_GLES2_NO_DMABUF");
++	if (no_dmabuf == NULL ||
++			(strcmp(no_dmabuf, "1") != 0 && strcmp(no_dmabuf, "true") != 0)) {
++		caps |= WLR_BUFFER_CAP_DMABUF;
++	}
++	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, caps);
+ 	renderer->wlr_renderer.features.output_color_transform = false;
+ 
+ 	wl_list_init(&renderer->buffers);
+@@ -456,7 +502,8 @@ struct wlr_renderer *fx_renderer_create_egl(struct wlr_egl *egl) {
+ 	wlr_log(WLR_INFO, "GL renderer: %s", glGetString(GL_RENDERER));
+ 	wlr_log(WLR_INFO, "Supported FX extensions: %s", exts_str);
+ 
+-	if (!renderer->egl->exts.EXT_image_dma_buf_import) {
++	if ((renderer->wlr_renderer.render_buffer_caps & WLR_BUFFER_CAP_DMABUF) &&
++			!renderer->egl->exts.EXT_image_dma_buf_import) {
+ 		wlr_log(WLR_ERROR, "EGL_EXT_image_dma_buf_import not supported");
+ 		free(renderer);
+ 		return NULL;
+diff --git a/render/fx_renderer/fx_texture.c b/render/fx_renderer/fx_texture.c
+index f69f735..14b1a11 100644
+--- a/render/fx_renderer/fx_texture.c
++++ b/render/fx_renderer/fx_texture.c
+@@ -407,11 +407,28 @@ struct wlr_texture *fx_texture_from_buffer(struct wlr_renderer *wlr_renderer,
+ 		struct wlr_buffer *buffer) {
+ 	struct fx_renderer *renderer = fx_get_renderer(wlr_renderer);
+ 
++	struct fx_framebuffer *fx_fb = fx_framebuffer_try_get(renderer, buffer);
++	if (fx_fb != NULL && fx_fb->is_data_ptr && fx_fb->tex != 0) {
++		struct fx_texture *texture =
++			fx_texture_create(renderer, buffer->width, buffer->height);
++		if (texture == NULL) {
++			return NULL;
++		}
++		texture->target = GL_TEXTURE_2D;
++		texture->buffer = fx_fb;
++		texture->drm_format = DRM_FORMAT_INVALID;
++		texture->has_alpha = pixel_format_has_alpha(fx_fb->drm_format);
++		texture->tex = fx_fb->tex;
++		wlr_buffer_lock(texture->buffer->buffer);
++		return &texture->wlr_texture;
++	}
++
+ 	void *data;
+ 	uint32_t format;
+ 	size_t stride;
+ 	struct wlr_dmabuf_attributes dmabuf;
+-	if (wlr_buffer_get_dmabuf(buffer, &dmabuf)) {
++	if ((wlr_renderer->render_buffer_caps & WLR_BUFFER_CAP_DMABUF) &&
++			wlr_buffer_get_dmabuf(buffer, &dmabuf)) {
+ 		return fx_texture_from_dmabuf(&renderer->wlr_renderer, buffer, &dmabuf);
+ 	} else if (wlr_buffer_begin_data_ptr_access(buffer,
+ 			WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &format, &stride)) {
+diff --git a/render/fx_renderer/util.c b/render/fx_renderer/util.c
+index dd044e0..a505f9a 100644
+--- a/render/fx_renderer/util.c
++++ b/render/fx_renderer/util.c
+@@ -7,6 +7,7 @@
+ #include "render/fx_renderer/util.h"
+ #include "util/env.h"
+ 
++#ifndef __TERMUX__
+ static int open_drm_render_node(void) {
+ 	uint32_t flags = 0;
+ 	int devices_len = drmGetDevices2(flags, NULL, 0);
+@@ -52,9 +53,11 @@ out:
+ 
+ 	return fd;
+ }
++#endif
+ 
+ bool open_preferred_drm_fd(struct wlr_backend *backend, int *drm_fd_ptr,
+ 		bool *own_drm_fd) {
++#ifndef __TERMUX__
+ 	if (*drm_fd_ptr >= 0) {
+ 		return true;
+ 	}
+@@ -107,4 +110,11 @@ bool open_preferred_drm_fd(struct wlr_backend *backend, int *drm_fd_ptr,
+ 	}
+ 
+ 	return false;
++#else
++	// handled later in egl.c
++	(void)backend;
++	(void)drm_fd_ptr;
++	(void)own_drm_fd;
++	return true;
++#endif
+ }
