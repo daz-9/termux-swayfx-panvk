@@ -11,7 +11,7 @@ BUILD_ROOT="${SWAYFX_BUILD_DIR:-$HOME/src/swayfx-panvk}"
 WLROOTS_VER="0.20.2"
 WLROOTS_URL="https://gitlab.freedesktop.org/wlroots/wlroots/-/archive/${WLROOTS_VER}/wlroots-${WLROOTS_VER}.tar.bz2"
 WLROOTS_SHA256="20c37b521dc3054b6e9627b79bdd45fc716db9ebc58bdf97e57e84d04b04610f"
-SCENEFX_COMMIT="98429c6f98f77b08b10e8cedd780966a4fe446fc"
+SCENEFX_COMMIT="6a7c568bd7dbdac4b2b92d6b9fa73881c603d665"
 SWAYFX_TAG="0.6.1"
 
 export PATH="$LOCAL_PREFIX/bin:$PATH"
