@@ -88,6 +88,8 @@ jobs:
           sudo mkdir -p "${TERMUX_PREFIX}" "${TERMUX_LOCAL}/lib/pkgconfig" "${TERMUX_LOCAL}/bin"
           sudo python3 scripts/ci/fetch-termux-sysroot.py /
           sudo chown -R "$(id -u):$(id -g)" /data
+          printf 'INPUT(-lc)\n' > "${TERMUX_PREFIX}/lib/librt.so"
+          printf 'INPUT(-lc)\n' > "${TERMUX_PREFIX}/lib/libpthread.so"
 
       - name: Create Meson cross & native files
         run: |
