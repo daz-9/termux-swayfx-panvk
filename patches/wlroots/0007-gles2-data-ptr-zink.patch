@@ -1,5 +1,5 @@
 diff --git a/include/render/gles2.h b/include/render/gles2.h
-index 6b852dc..716a44c 100644
+index 6b852dc..5adc782 100644
 --- a/include/render/gles2.h
 +++ b/include/render/gles2.h
 @@ -103,6 +103,8 @@ struct wlr_gles2_buffer {
@@ -11,11 +11,27 @@ index 6b852dc..716a44c 100644
  
  	EGLImageKHR image;
  	GLuint rbo;
+@@ -139,6 +141,9 @@ struct wlr_gles2_render_pass {
+ 	struct wlr_gles2_render_timer *timer;
+ 	struct wlr_drm_syncobj_timeline *signal_timeline;
+ 	uint64_t signal_point;
++
++	bool has_dirty;
++	int32_t dirty_x1, dirty_y1, dirty_x2, dirty_y2;
+ };
+ 
+ bool is_gles2_pixel_format_supported(const struct wlr_gles2_renderer *renderer,
 diff --git a/render/gles2/pass.c b/render/gles2/pass.c
-index a70ea13..b83a8fc 100644
+index a70ea13..2e7342d 100644
 --- a/render/gles2/pass.c
 +++ b/render/gles2/pass.c
-@@ -7,6 +7,7 @@
+@@ -1,4 +1,5 @@
+ #include <stdlib.h>
++#include <string.h>
+ #include <assert.h>
+ #include <pixman.h>
+ #include <time.h>
+@@ -7,6 +8,7 @@
  #include <wlr/util/transform.h>
  #include "render/egl.h"
  #include "render/gles2.h"
@@ -23,55 +39,144 @@ index a70ea13..b83a8fc 100644
  #include "util/matrix.h"
  
  #define MAX_QUADS 86 // 4kb
-@@ -60,6 +61,48 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+@@ -60,6 +62,74 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
  		glFlush();
  	}
  
-+	if (pass->buffer->is_data_ptr) {
++	if (pass->buffer->is_data_ptr && pass->has_dirty) {
 +		struct wlr_buffer *wlr_buffer = pass->buffer->buffer;
-+		const struct wlr_gles2_pixel_format *fmt =
-+			get_gles2_format_from_drm(pass->buffer->drm_format);
-+		const struct wlr_pixel_format_info *drm_fmt =
-+			fmt != NULL ? drm_get_pixel_format_info(fmt->drm_format) : NULL;
-+		void *data = NULL;
-+		uint32_t format = 0;
-+		size_t stride = 0;
-+		if (fmt == NULL || drm_fmt == NULL) {
-+			wlr_log(WLR_ERROR, "Unsupported data_ptr pixel format 0x%"PRIX32,
-+				pass->buffer->drm_format);
-+			goto out;
-+		}
-+		if (fmt->gl_format == GL_BGRA_EXT &&
-+				!pass->buffer->renderer->exts.EXT_read_format_bgra) {
-+			wlr_log(WLR_ERROR,
-+				"Cannot read pixels: missing GL_EXT_read_format_bgra extension");
-+			goto out;
-+		}
-+		if (!wlr_buffer_begin_data_ptr_access(wlr_buffer,
-+				WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
-+			wlr_log(WLR_ERROR, "Failed to lock data_ptr buffer for GLES2 readback");
-+			goto out;
-+		}
-+		GLuint fbo = gles2_buffer_get_fbo(pass->buffer);
-+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
-+		uint32_t pack_stride = pixel_format_info_min_stride(drm_fmt, wlr_buffer->width);
-+		if (pack_stride == stride) {
-+			glReadPixels(0, 0, wlr_buffer->width, wlr_buffer->height,
-+				fmt->gl_format, fmt->gl_type, data);
-+		} else {
-+			unsigned char *p = data;
-+			for (int32_t i = 0; i < wlr_buffer->height; ++i) {
-+				glReadPixels(0, i, wlr_buffer->width, 1,
-+					fmt->gl_format, fmt->gl_type, p + (size_t)i * stride);
++		int32_t x1 = pass->dirty_x1 < 0 ? 0 : pass->dirty_x1;
++		int32_t y1 = pass->dirty_y1 < 0 ? 0 : pass->dirty_y1;
++		int32_t x2 = pass->dirty_x2 > wlr_buffer->width ? wlr_buffer->width : pass->dirty_x2;
++		int32_t y2 = pass->dirty_y2 > wlr_buffer->height ? wlr_buffer->height : pass->dirty_y2;
++		if (x2 > x1 && y2 > y1) {
++			const struct wlr_gles2_pixel_format *fmt =
++				get_gles2_format_from_drm(pass->buffer->drm_format);
++			const struct wlr_pixel_format_info *drm_fmt =
++				fmt != NULL ? drm_get_pixel_format_info(fmt->drm_format) : NULL;
++			void *data = NULL;
++			uint32_t format = 0;
++			size_t stride = 0;
++			if (fmt == NULL || drm_fmt == NULL) {
++				wlr_log(WLR_ERROR, "Unsupported data_ptr pixel format 0x%"PRIX32,
++					pass->buffer->drm_format);
++				goto out;
 +			}
++			if (fmt->gl_format == GL_BGRA_EXT &&
++					!pass->buffer->renderer->exts.EXT_read_format_bgra) {
++				wlr_log(WLR_ERROR,
++					"Cannot read pixels: missing GL_EXT_read_format_bgra extension");
++				goto out;
++			}
++			if (!wlr_buffer_begin_data_ptr_access(wlr_buffer,
++					WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
++				wlr_log(WLR_ERROR, "Failed to lock data_ptr buffer for GLES2 readback");
++				goto out;
++			}
++			GLuint fbo = gles2_buffer_get_fbo(pass->buffer);
++			glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++			glPixelStorei(GL_PACK_ALIGNMENT, 1);
++			int32_t dirty_w = x2 - x1;
++			int32_t dirty_h = y2 - y1;
++			uint32_t pack_stride = pixel_format_info_min_stride(drm_fmt, wlr_buffer->width);
++			unsigned char *dst = data;
++			if (x1 == 0 && dirty_w == wlr_buffer->width && pack_stride == stride) {
++				glReadPixels(0, y1, wlr_buffer->width, dirty_h,
++					fmt->gl_format, fmt->gl_type, dst + (size_t)y1 * stride);
++			} else {
++				uint32_t row_bytes = pixel_format_info_min_stride(drm_fmt, dirty_w);
++				uint32_t x_off_bytes = pixel_format_info_min_stride(drm_fmt, x1);
++				if (dirty_h == 1) {
++					glReadPixels(x1, y1, dirty_w, 1, fmt->gl_format, fmt->gl_type,
++						dst + (size_t)y1 * stride + x_off_bytes);
++				} else {
++					unsigned char *scratch = malloc((size_t)row_bytes * (size_t)dirty_h);
++					if (scratch != NULL) {
++						glReadPixels(x1, y1, dirty_w, dirty_h,
++							fmt->gl_format, fmt->gl_type, scratch);
++						for (int32_t i = 0; i < dirty_h; ++i) {
++							memcpy(dst + (size_t)(y1 + i) * stride + x_off_bytes,
++								scratch + (size_t)i * row_bytes, row_bytes);
++						}
++						free(scratch);
++					} else {
++						for (int32_t i = 0; i < dirty_h; ++i) {
++							glReadPixels(x1, y1 + i, dirty_w, 1, fmt->gl_format, fmt->gl_type,
++								dst + (size_t)(y1 + i) * stride + x_off_bytes);
++						}
++					}
++				}
++			}
++			wlr_buffer_end_data_ptr_access(wlr_buffer);
 +		}
-+		wlr_buffer_end_data_ptr_access(wlr_buffer);
 +	}
 +
  	ok = true;
  
  out:
+@@ -75,7 +145,27 @@ out:
+ 	return ok;
+ }
+ 
+-static void render(const struct wlr_box *box, const pixman_region32_t *clip, GLint attrib) {
++static void pass_mark_dirty(struct wlr_gles2_render_pass *pass,
++		int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
++	if (x2 <= x1 || y2 <= y1) {
++		return;
++	}
++	if (!pass->has_dirty) {
++		pass->dirty_x1 = x1;
++		pass->dirty_y1 = y1;
++		pass->dirty_x2 = x2;
++		pass->dirty_y2 = y2;
++		pass->has_dirty = true;
++	} else {
++		if (x1 < pass->dirty_x1) pass->dirty_x1 = x1;
++		if (y1 < pass->dirty_y1) pass->dirty_y1 = y1;
++		if (x2 > pass->dirty_x2) pass->dirty_x2 = x2;
++		if (y2 > pass->dirty_y2) pass->dirty_y2 = y2;
++	}
++}
++
++static void render(struct wlr_gles2_render_pass *pass,
++		const struct wlr_box *box, const pixman_region32_t *clip, GLint attrib) {
+ 	pixman_region32_t region;
+ 	pixman_region32_init_rect(&region, box->x, box->y, box->width, box->height);
+ 
+@@ -90,6 +180,9 @@ static void render(const struct wlr_box *box, const pixman_region32_t *clip, GLi
+ 		return;
+ 	}
+ 
++	const pixman_box32_t *ext = pixman_region32_extents(&region);
++	pass_mark_dirty(pass, ext->x1, ext->y1, ext->x2, ext->y2);
++
+ 	glEnableVertexAttribArray(attrib);
+ 
+ 	for (int i = 0; i < rects_len;) {
+@@ -247,7 +340,7 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
+ 	set_proj_matrix(shader->proj, pass->projection_matrix, &dst_box);
+ 	set_tex_matrix(shader->tex_proj, options->transform, &src_fbox);
+ 
+-	render(&dst_box, options->clip, shader->pos_attrib);
++	render(pass, &dst_box, options->clip, shader->pos_attrib);
+ 
+ 	glBindTexture(texture->target, 0);
+ 	pop_gles2_debug(renderer);
+@@ -273,12 +366,13 @@ static void render_pass_add_rect(struct wlr_render_pass *wlr_pass,
+ 			box.height == wlr_buffer->height) {
+ 		glClearColor(color->r, color->g, color->b, color->a);
+ 		glClear(GL_COLOR_BUFFER_BIT);
++		pass_mark_dirty(pass, 0, 0, wlr_buffer->width, wlr_buffer->height);
+ 	} else {
+ 		setup_blending(blend_mode);
+ 		glUseProgram(renderer->shaders.quad.program);
+ 		set_proj_matrix(renderer->shaders.quad.proj, pass->projection_matrix, &box);
+ 		glUniform4f(renderer->shaders.quad.color, color->r, color->g, color->b, color->a);
+-		render(&box, options->clip, renderer->shaders.quad.pos_attrib);
++		render(pass, &box, options->clip, renderer->shaders.quad.pos_attrib);
+ 	}
+ 
+ 	pop_gles2_debug(renderer);
 diff --git a/render/gles2/renderer.c b/render/gles2/renderer.c
 index e362dae..117d9e7 100644
 --- a/render/gles2/renderer.c

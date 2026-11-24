@@ -21,6 +21,20 @@ index cafd7a5..900c3be 100644
  struct fx_framebuffer *fx_framebuffer_get_or_create(struct fx_renderer *renderer,
  		struct wlr_buffer *wlr_buffer);
  
+diff --git a/include/scenefx/render/pass.h b/include/scenefx/render/pass.h
+index 8fe8f37..317a58a 100644
+--- a/include/scenefx/render/pass.h
++++ b/include/scenefx/render/pass.h
+@@ -27,6 +27,9 @@ struct fx_gles_render_pass {
+ 	// NULL when no advanced effects like blur is being used in the current pass.
+ 	// Call `fx_render_pass_init_offscreen_buffers` to use advanced effects.
+ 	struct fx_offscreen_buffers *fx_offscreen_buffers;
++
++	bool has_dirty;
++	int32_t dirty_x1, dirty_y1, dirty_x2, dirty_y2;
+ };
+ 
+ struct fx_render_texture_options {
 diff --git a/render/egl.c b/render/egl.c
 index 85d5f6f..ee56e4b 100644
 --- a/render/egl.c
@@ -227,10 +241,18 @@ index d514b34..b99ddf5 100644
  	wlr_egl_restore_context(&prev_ctx);
  
 diff --git a/render/fx_renderer/fx_pass.c b/render/fx_renderer/fx_pass.c
-index b3b1a13..dc55bee 100644
+index b3b1a13..02fa89c 100644
 --- a/render/fx_renderer/fx_pass.c
 +++ b/render/fx_renderer/fx_pass.c
-@@ -15,6 +15,7 @@
+@@ -1,6 +1,7 @@
+ #include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <assert.h>
+ #include <pixman.h>
+ #include <time.h>
+@@ -15,6 +16,7 @@
  #include "render/fx_renderer/fx_renderer.h"
  #include "render/fx_renderer/shaders.h"
  #include "render/pass.h"
@@ -238,55 +260,182 @@ index b3b1a13..dc55bee 100644
  #include "render/tracy.h"
  #include "scenefx/render/fx_renderer/fx_offscreen_buffers.h"
  #include "scenefx/render/fx_renderer/fx_renderer.h"
-@@ -151,6 +152,48 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+@@ -151,6 +153,74 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
  		glFlush();
  	}
  
-+	if (pass->buffer->is_data_ptr && !pass->buffer->skip_readback) {
++	if (pass->buffer->is_data_ptr && !pass->buffer->skip_readback && pass->has_dirty) {
 +		struct wlr_buffer *wlr_buffer = pass->buffer->buffer;
-+		const struct fx_pixel_format *fmt =
-+			get_fx_format_from_drm(pass->buffer->drm_format);
-+		const struct wlr_pixel_format_info *drm_fmt =
-+			fmt != NULL ? drm_get_pixel_format_info(fmt->drm_format) : NULL;
-+		void *data = NULL;
-+		uint32_t format = 0;
-+		size_t stride = 0;
-+		if (fmt == NULL || drm_fmt == NULL) {
-+			wlr_log(WLR_ERROR, "Unsupported data_ptr pixel format 0x%"PRIX32,
-+				pass->buffer->drm_format);
-+			goto out;
-+		}
-+		if (fmt->gl_format == GL_BGRA_EXT &&
-+				!pass->buffer->renderer->exts.EXT_read_format_bgra) {
-+			wlr_log(WLR_ERROR,
-+				"Cannot read pixels: missing GL_EXT_read_format_bgra extension");
-+			goto out;
-+		}
-+		if (!wlr_buffer_begin_data_ptr_access(wlr_buffer,
-+				WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
-+			wlr_log(WLR_ERROR, "Failed to lock data_ptr buffer for FX readback");
-+			goto out;
-+		}
-+		GLuint fbo = fx_framebuffer_get_fbo(pass->buffer);
-+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
-+		uint32_t pack_stride = pixel_format_info_min_stride(drm_fmt, wlr_buffer->width);
-+		if (pack_stride == stride) {
-+			glReadPixels(0, 0, wlr_buffer->width, wlr_buffer->height,
-+				fmt->gl_format, fmt->gl_type, data);
-+		} else {
-+			unsigned char *p = data;
-+			for (int32_t i = 0; i < wlr_buffer->height; ++i) {
-+				glReadPixels(0, i, wlr_buffer->width, 1,
-+					fmt->gl_format, fmt->gl_type, p + (size_t)i * stride);
++		int32_t x1 = pass->dirty_x1 < 0 ? 0 : pass->dirty_x1;
++		int32_t y1 = pass->dirty_y1 < 0 ? 0 : pass->dirty_y1;
++		int32_t x2 = pass->dirty_x2 > wlr_buffer->width ? wlr_buffer->width : pass->dirty_x2;
++		int32_t y2 = pass->dirty_y2 > wlr_buffer->height ? wlr_buffer->height : pass->dirty_y2;
++		if (x2 > x1 && y2 > y1) {
++			const struct fx_pixel_format *fmt =
++				get_fx_format_from_drm(pass->buffer->drm_format);
++			const struct wlr_pixel_format_info *drm_fmt =
++				fmt != NULL ? drm_get_pixel_format_info(fmt->drm_format) : NULL;
++			void *data = NULL;
++			uint32_t format = 0;
++			size_t stride = 0;
++			if (fmt == NULL || drm_fmt == NULL) {
++				wlr_log(WLR_ERROR, "Unsupported data_ptr pixel format 0x%"PRIX32,
++					pass->buffer->drm_format);
++				goto out;
 +			}
++			if (fmt->gl_format == GL_BGRA_EXT &&
++					!pass->buffer->renderer->exts.EXT_read_format_bgra) {
++				wlr_log(WLR_ERROR,
++					"Cannot read pixels: missing GL_EXT_read_format_bgra extension");
++				goto out;
++			}
++			if (!wlr_buffer_begin_data_ptr_access(wlr_buffer,
++					WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
++				wlr_log(WLR_ERROR, "Failed to lock data_ptr buffer for FX readback");
++				goto out;
++			}
++			GLuint fbo = fx_framebuffer_get_fbo(pass->buffer);
++			glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++			glPixelStorei(GL_PACK_ALIGNMENT, 1);
++			int32_t dirty_w = x2 - x1;
++			int32_t dirty_h = y2 - y1;
++			uint32_t pack_stride = pixel_format_info_min_stride(drm_fmt, wlr_buffer->width);
++			unsigned char *dst = data;
++			if (x1 == 0 && dirty_w == wlr_buffer->width && pack_stride == stride) {
++				glReadPixels(0, y1, wlr_buffer->width, dirty_h,
++					fmt->gl_format, fmt->gl_type, dst + (size_t)y1 * stride);
++			} else {
++				uint32_t row_bytes = pixel_format_info_min_stride(drm_fmt, dirty_w);
++				uint32_t x_off_bytes = pixel_format_info_min_stride(drm_fmt, x1);
++				if (dirty_h == 1) {
++					glReadPixels(x1, y1, dirty_w, 1, fmt->gl_format, fmt->gl_type,
++						dst + (size_t)y1 * stride + x_off_bytes);
++				} else {
++					unsigned char *scratch = malloc((size_t)row_bytes * (size_t)dirty_h);
++					if (scratch != NULL) {
++						glReadPixels(x1, y1, dirty_w, dirty_h,
++							fmt->gl_format, fmt->gl_type, scratch);
++						for (int32_t i = 0; i < dirty_h; ++i) {
++							memcpy(dst + (size_t)(y1 + i) * stride + x_off_bytes,
++								scratch + (size_t)i * row_bytes, row_bytes);
++						}
++						free(scratch);
++					} else {
++						for (int32_t i = 0; i < dirty_h; ++i) {
++							glReadPixels(x1, y1 + i, dirty_w, 1, fmt->gl_format, fmt->gl_type,
++								dst + (size_t)(y1 + i) * stride + x_off_bytes);
++						}
++					}
++				}
++			}
++			wlr_buffer_end_data_ptr_access(wlr_buffer);
 +		}
-+		wlr_buffer_end_data_ptr_access(wlr_buffer);
 +	}
 +
  	ok = true;
  
  out:
+@@ -237,7 +307,27 @@ static void stencil_mask_fini(void) {
+ 	glDisable(GL_STENCIL_TEST);
+ }
+ 
+-static void render(const struct wlr_box *box, const pixman_region32_t *clip, GLint attrib) {
++static void pass_mark_dirty(struct fx_gles_render_pass *pass,
++		int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
++	if (pass == NULL || x2 <= x1 || y2 <= y1) {
++		return;
++	}
++	if (!pass->has_dirty) {
++		pass->dirty_x1 = x1;
++		pass->dirty_y1 = y1;
++		pass->dirty_x2 = x2;
++		pass->dirty_y2 = y2;
++		pass->has_dirty = true;
++	} else {
++		if (x1 < pass->dirty_x1) pass->dirty_x1 = x1;
++		if (y1 < pass->dirty_y1) pass->dirty_y1 = y1;
++		if (x2 > pass->dirty_x2) pass->dirty_x2 = x2;
++		if (y2 > pass->dirty_y2) pass->dirty_y2 = y2;
++	}
++}
++
++static void render(struct fx_gles_render_pass *pass,
++		const struct wlr_box *box, const pixman_region32_t *clip, GLint attrib) {
+ 	pixman_region32_t region;
+ 	pixman_region32_init_rect(&region, box->x, box->y, box->width, box->height);
+ 
+@@ -252,6 +342,9 @@ static void render(const struct wlr_box *box, const pixman_region32_t *clip, GLi
+ 		return;
+ 	}
+ 
++	const pixman_box32_t *ext = pixman_region32_extents(&region);
++	pass_mark_dirty(pass, ext->x1, ext->y1, ext->x2, ext->y2);
++
+ 	glEnableVertexAttribArray(attrib);
+ 
+ 	for (int i = 0; i < rects_len;) {
+@@ -497,7 +590,7 @@ void fx_render_pass_add_texture(struct fx_gles_render_pass *pass,
+ 	set_proj_matrix(shader->proj, pass->projection_matrix, &dst_box);
+ 	set_tex_matrix(shader->tex_proj, options->transform, &src_fbox);
+ 
+-	render(&dst_box, &clip_region, shader->pos_attrib);
++	render(pass, &dst_box, &clip_region, shader->pos_attrib);
+ 	pixman_region32_fini(&clip_region);
+ 
+ 	glBindTexture(texture->target, 0);
+@@ -538,6 +631,7 @@ void fx_render_pass_add_rect(struct fx_gles_render_pass *pass,
+ 		TRACY_ZONE_TEXT_f("Color RGBA: %f, %f, %f, %f", color->r, color->g, color->b, color->a);
+ 		glClearColor(color->r, color->g, color->b, color->a);
+ 		glClear(GL_COLOR_BUFFER_BIT);
++		pass_mark_dirty(pass, 0, 0, wlr_buffer->width, wlr_buffer->height);
+ 	} else {
+ 		const struct wlr_box *clipped_region_box = &fx_options->clipped_region.area;
+ 		const struct fx_corner_fradii *clipped_region_corners = &fx_options->clipped_region.corners;
+@@ -630,7 +724,7 @@ void fx_render_pass_add_rect(struct fx_gles_render_pass *pass,
+ 			uniform_corner_radii_set(&shader.effects.clip_radius, clipped_region_corners);
+ 		}
+ 
+-		render(&box, &clip_region, shader.pos_attrib);
++		render(pass, &box, &clip_region, shader.pos_attrib);
+ 
+ 		pixman_region32_fini(&clip_region);
+ 	}
+@@ -746,7 +840,7 @@ void fx_render_pass_add_rounded_rect(struct fx_gles_render_pass *pass,
+ 	struct fx_corner_fradii corners = fx_options->corners;
+ 	uniform_corner_radii_set(&shader.radius, &corners);
+ 
+-	render(&box, &clip_region, renderer->shaders.quad_round.pos_attrib);
++	render(pass, &box, &clip_region, renderer->shaders.quad_round.pos_attrib);
+ 	pixman_region32_fini(&clip_region);
+ 
+ 	pop_fx_debug(renderer);
+@@ -824,7 +918,7 @@ void fx_render_pass_add_box_shadow(struct fx_gles_render_pass *pass,
+ 	glUniform2f(renderer->shaders.box_shadow.clip_position, clipped_region_box.x, clipped_region_box.y);
+ 	glUniform2f(renderer->shaders.box_shadow.clip_size, clipped_region_box.width, clipped_region_box.height);
+ 
+-	render(&box, &clip_region, renderer->shaders.box_shadow.pos_attrib);
++	render(pass, &box, &clip_region, renderer->shaders.box_shadow.pos_attrib);
+ 	pixman_region32_fini(&clip_region);
+ 
+ 	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+@@ -916,7 +1010,7 @@ static void render_blur_segments(struct fx_gles_render_pass *pass,
+ 	set_proj_matrix(shader->proj, pass->projection_matrix, &dst_box);
+ 	set_tex_matrix(shader->tex_proj, options->transform, &src_fbox);
+ 
+-	render(&dst_box, options->clip, shader->pos_attrib);
++	render(NULL, &dst_box, options->clip, shader->pos_attrib);
+ 
+ 	glBindTexture(texture->target, 0);
+ 	pop_fx_debug(renderer);
+@@ -981,7 +1075,7 @@ static void render_blur_effects(struct fx_gles_render_pass *pass,
+ 	set_proj_matrix(shader.proj, pass->projection_matrix, &dst_box);
+ 	set_tex_matrix(shader.tex_proj, options->transform, &src_fbox);
+ 
+-	render(&dst_box, options->clip, shader.pos_attrib);
++	render(NULL, &dst_box, options->clip, shader.pos_attrib);
+ 
+ 	glBindTexture(texture->target, 0);
+ 
 diff --git a/render/fx_renderer/fx_renderer.c b/render/fx_renderer/fx_renderer.c
 index 5e751d4..f104ff3 100644
 --- a/render/fx_renderer/fx_renderer.c
@@ -445,3 +594,27 @@ index dd044e0..a505f9a 100644
 +	return true;
 +#endif
  }
+diff --git a/types/scene/wlr_scene.c b/types/scene/wlr_scene.c
+index 899a9d1..a55444b 100644
+--- a/types/scene/wlr_scene.c
++++ b/types/scene/wlr_scene.c
+@@ -3415,8 +3415,18 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
+ 		&render_data.damage);
+ 
+ 	struct fx_gles_render_pass *fx_pass = fx_get_render_pass(render_pass);
++	bool needs_offscreen_buffers = false;
++	for (int i = list_len - 1; i >= 0; i--) {
++		enum wlr_scene_node_type type = list_data[i].node->type;
++		if ((type == WLR_SCENE_NODE_BLUR || type == WLR_SCENE_NODE_OPTIMIZED_BLUR)
++				&& is_scene_blur_enabled(&scene_output->scene->blur_data)) {
++			needs_offscreen_buffers = true;
++			break;
++		}
++	}
+ 	bool should_compensate_blur = false;
+-	if (fx_render_pass_init_offscreen_buffers(render_pass, output)
++	if (needs_offscreen_buffers
++			&& fx_render_pass_init_offscreen_buffers(render_pass, output)
+ 			&& pixman_region32_not_empty(&render_data.damage)) {
+ 		// Blur artifact prevention
+ 		// Note: Supports individual blur node blur_data
